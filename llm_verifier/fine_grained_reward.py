@@ -15,6 +15,7 @@ any OpenAI-compatible server with logprobs), the score expectation
 `extract_score`, the pairwise prompt, and a cached batch scorer.
 """
 
+
 import base64
 import json
 import math
@@ -122,6 +123,24 @@ def create_gemini_client():
 # ---------------------------------------------------------------------------
 # OpenAI-compatible client (vLLM, SGLang, OpenAI, ...)
 # ---------------------------------------------------------------------------
+def create_ollama_client(base_url=None, api_key=None):
+    """Build an ``openai`` client for any OpenAI-compatible server that
+    returns token-level logprobs (vLLM, SGLang, OpenAI, DeepSeek).
+    ``base_url`` defaults to ``OPENAI_BASE_URL``, ``api_key`` to
+    ``OPENAI_API_KEY`` then ``DEEPSEEK_API_KEY``. A DeepSeek ``base_url``
+    gets the DeepSeek call path."""
+    from ollama import Client
+    load_dotenv()
+    base_url = base_url or os.environ.get("OLLAMA_HOST")
+    if not base_url:
+        raise MissingAPIKeyError(
+            "set OLLAMA_HOST to run a local model endpoint "
+            "(e.g. http://localhost:8000/v1 for OLLAMA)")
+    client = Client(host=base_url)
+    # if "api.deepseek.com" in base_url:
+    #     client._llm_verifier_model = DEEPSEEK_MODEL
+    #     client._llm_verifier_deepseek = True
+    return client
 
 def create_openai_client(base_url=None, api_key=None):
     """Build an ``openai`` client for any OpenAI-compatible server that
@@ -166,15 +185,26 @@ def create_deepseek_client(api_key=None, model=DEEPSEEK_MODEL):
 
 
 def create_client():
-    """Build a verifier client from the environment: ``OPENAI_BASE_URL``,
+    """Build a verifier client from the environment: ``OLLAMA_HOST`, then ``OPENAI_BASE_URL``,
     then ``DEEPSEEK_API_KEY``, then ``VERTEX_API_KEY``. Raises
     `MissingAPIKeyError` when none is configured."""
     load_dotenv()
+
+    if os.environ.get("OLLAMA_HOST"):
+        client = create_ollama_client()
+
+
     if os.environ.get("OPENAI_BASE_URL"):
-        return create_openai_client()
+        client = create_openai_client()
+
+    
     if os.environ.get("DEEPSEEK_API_KEY"):
-        return create_deepseek_client()
-    return create_gemini_client()
+        client = create_deepseek_client()
+
+    else:
+        client = create_gemini_client()
+
+    return client
 
 
 def default_max_workers():
