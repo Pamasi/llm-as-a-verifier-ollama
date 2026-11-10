@@ -23,7 +23,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import ollama
 DEFAULT_MODEL = "gemini-2.5-flash"
 # DeepSeek's rolling alias endpoint: currently serves DeepSeek V4.1 Flash.
 DEEPSEEK_MODEL = "deepseek-flash"
@@ -123,20 +123,20 @@ def create_gemini_client():
 # ---------------------------------------------------------------------------
 # OpenAI-compatible client (vLLM, SGLang, OpenAI, ...)
 # ---------------------------------------------------------------------------
-def create_ollama_client(base_url=None, api_key=None):
+def create_ollama_client(base_url=None):
     """Build an ``openai`` client for any OpenAI-compatible server that
     returns token-level logprobs (vLLM, SGLang, OpenAI, DeepSeek).
     ``base_url`` defaults to ``OPENAI_BASE_URL``, ``api_key`` to
     ``OPENAI_API_KEY`` then ``DEEPSEEK_API_KEY``. A DeepSeek ``base_url``
     gets the DeepSeek call path."""
-    from ollama import Client
+  
     load_dotenv()
     base_url = base_url or os.environ.get("OLLAMA_HOST")
     if not base_url:
         raise MissingAPIKeyError(
             "set OLLAMA_HOST to run a local model endpoint "
             "(e.g. http://localhost:8000/v1 for OLLAMA)")
-    client = Client(host=base_url)
+    client = ollama.Client(host=base_url)
     # if "api.deepseek.com" in base_url:
     #     client._llm_verifier_model = DEEPSEEK_MODEL
     #     client._llm_verifier_deepseek = True
@@ -179,8 +179,8 @@ def create_deepseek_client(api_key=None, model=DEEPSEEK_MODEL):
             "set DEEPSEEK_API_KEY in .env or environment to use DeepSeek "
             "as the verifier")
     client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
-    client._llm_verifier_model = model
-    client._llm_verifier_deepseek = True
+    client._llm_verifier_model = model # type: ignore
+    client._llm_verifier_deepseek = True # type: ignore
     return client
 
 
@@ -194,11 +194,11 @@ def create_client():
         client = create_ollama_client()
 
 
-    if os.environ.get("OPENAI_BASE_URL"):
+    elif os.environ.get("OPENAI_BASE_URL"):
         client = create_openai_client()
 
     
-    if os.environ.get("DEEPSEEK_API_KEY"):
+    elif os.environ.get("DEEPSEEK_API_KEY"):
         client = create_deepseek_client()
 
     else:
@@ -430,6 +430,122 @@ def resolve_model(client, model=DEFAULT_MODEL):
         client._llm_verifier_model = served
     return served
 
+def call_ollama(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
+                images=None):
+    """Call an OpenAI-compatible verifier with logprobs.
+    Returns (text, tokens, position_logprobs) — the same shape as
+    `call_gemini`, so `extract_score` works unchanged."""
+    content = prompt
+    imgs = as_image_list(images)
+    if imgs:
+        content = [{"type": "text", "text": prompt}]
+        for img in imgs:
+            data, mime = load_image(img)
+            b64 = base64.b64encode(data).decode("ascii")
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    params = dict(
+        model=resolve_model(client, model),
+        messages=[{"role": "user", "content": content}],
+        options={ 'num_predict':4096,
+        'temperature':1.0,
+        },
+        logprobs=True,
+        top_logprobs=top_logprobs,  # the OpenAI API caps this at 20
+    )
+
+    response = client.chat(**params)
+    USAGE.record(response)
+
+    choice = response
+    text = choice['message']['content'] or ""
+    tokens = None
+    position_logprobs = None
+
+    if choice.logprobs:
+        tokens, position_logprobs = [], []
+        for pos in choice.logprobs:
+            tokens.append(pos.token)
+            alts = [(alt.token, alt.logprob)
+                    for alt in (pos.top_logprobs or [])]
+            if not alts:
+                alts = [(pos.token, pos.logprob)]
+            position_logprobs.append(alts)
+
+    # Open models don't reliably emit the score tags, so keep only the
+    # analysis, prefill each tag, and read the letter distribution at that
+    # exact position. DeepSeek emits the tags itself (and lacks the prefill
+    # params), so it skips this.
+    tags = [t for t in ("<score_A>", "<score_B>") if t in prompt]
+    if tags and not getattr(client, "_llm_verifier_deepseek", False):
+        idx = min([text.find(t) for t in tags if t in (text or "")]
+                  or [len(text or "")])
+        analysis = (text or "")[:idx].rstrip()
+        tokens = []
+        position_logprobs = []
+        for tag in tags:
+            prefix = (analysis or "") + f"\n{tag}"
+            # Some models (e.g. Qwen VL) put nearly all their mass on the
+            # letter WITH a leading space after the prefilled ">"; allow both
+            # spellings so the grammar mask keeps the real distribution.
+            letters = [chr(65 + i) for i in range(GRANULARITY)]
+            letters += [" " + c for c in letters]
+            try:
+                # Constrain the prefilled position to the 20 score letters, so
+                # the returned top-logprobs are the renormalized distribution
+                # over the scale itself.
+                response = ollama.chat(
+                    model=params['model'],
+                    messages=[{"role": "user", "content": content}, {"role": "assistant", "content": prefix} ],
+                    logprobs=True,
+                    top_logprobs=top_logprobs,
+                    # Equivalente di structured_outputs
+                    format= {
+                    "type": "object",
+                    "properties": {
+                        "choice": {
+                            "type": "string",
+                            "enum": letters  
+                        }
+                    },
+                    "required": ["choice"]
+                },
+                    
+                options={
+                    "temperature": 1.0,
+                    "num_predict": 1  
+                }
+                )
+
+            except Exception:
+                return text, tokens or None, position_logprobs or None
+            USAGE.record(response)
+            choice = response
+            # Servers running a reasoning parser (vLLM --reasoning-parser
+            # glm45 / deepseek_v4 / deepseek_r1, ...) classify the
+            # prefill-continued token as reasoning, so message.content is None.
+            # Read the letter from the reasoning field (as in PR #6), and if the
+            # server exposes neither, recover it from the logprobs: the top
+            # token at this position IS the sampled letter.
+            letter = (choice['message']['content'] 
+                    or getattr(choice['message'], "reasoning", None)
+                    or getattr(choice['message'], "reasoning_content", None)
+                    or "").strip()
+            alts = []
+            if choice.logprobs:
+                pos = choice.logprobs[0]
+                alts = [(alt.token, alt.logprob)
+                        for alt in (pos.top_logprobs or [])]
+                if not letter:
+                    letter = (pos.token or (alts[0][0] if alts else "")).strip()
+            closing = "</" + tag[1:]
+            text = prefix + letter + closing
+            tokens += [f"\n{tag}", letter, closing]
+            position_logprobs += [[(f"\n{tag}", 0.0)], alts, [(closing, 0.0)]]
+       
+    return text, tokens, position_logprobs
+
+
 
 def call_openai(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
                 images=None):
@@ -513,11 +629,11 @@ def _score_tags_by_prefill(client, model, messages, text, tags,
             # Constrain the prefilled position to the 20 score letters, so
             # the returned top-logprobs are the renormalized distribution
             # over the scale itself.
-            response = client.chat.completions.create(
+            response = client.generate(
                 model=model,
                 messages=messages + [{"role": "assistant",
                                       "content": prefix}],
-                max_tokens=1,
+                num_pred=1,
                 temperature=1.0,
                 logprobs=True,
                 top_logprobs=top_logprobs,
@@ -613,11 +729,19 @@ def call_verifier(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
     """Route to the DeepSeek, OpenAI-compatible, or Gemini call based on the
     client type. Returns (text, tokens, position_logprobs)."""
     if getattr(client, "_llm_verifier_deepseek", False):
-        return call_deepseek(client, prompt, model, top_logprobs,
+         text, tokens, position_logprobs = call_deepseek(client, prompt, model, top_logprobs,
                              images=images)
-    if _is_openai_client(client):
-        return call_openai(client, prompt, model, top_logprobs, images=images)
-    return call_gemini(client, prompt, model, top_logprobs, images=images)
+
+    elif isinstance(client, ollama.Client):
+        text, tokens, position_logprobs=  call_ollama(client, prompt, model, top_logprobs, images=images)
+
+    elif _is_openai_client(client):
+        text, tokens, position_logprobs=  call_openai(client, prompt, model, top_logprobs, images=images)
+
+    else:
+        text, tokens, position_logprobs= call_gemini(client, prompt, model, top_logprobs, images=images)
+
+    return  text, tokens, position_logprobs
 
 
 def call_gemini(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
