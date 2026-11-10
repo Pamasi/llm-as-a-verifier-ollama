@@ -67,7 +67,7 @@ tracking, and reinforcement learning.
 
 Run a first end-to-end selection (requires `DEEPSEEK_API_KEY` or `VERTEX_API_KEY` in `.env`, or an OpenAI-compatible server that returns
 logprobs — e.g. `vllm serve Qwen/Qwen3.5-9B` with
-`OPENAI_BASE_URL=http://localhost:8000/v1`):
+`OPENAI_BASE_URL=http://localhost:8000/v1`) to use VLLM or `OLLAMA_HOST=127.0.0.1:11434` to use OLLAMA:
 
 ```python
 import llm_verifier
