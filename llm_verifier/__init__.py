@@ -129,6 +129,7 @@ def select(
     progress: Optional[bool] = None,
     on_error: str = "tie",
     client: Any = None,
+    max_token:int=4096
 ) -> VerifierResult:
     """Select the best of N agent trajectories for a single task.
 
@@ -164,6 +165,8 @@ def select(
             one is built from the environment (``OPENAI_BASE_URL``, then
             ``DEEPSEEK_API_KEY``, then ``VERTEX_API_KEY``). The backend must
             expose token-level logprobs.
+
+        max_token: max token of the text prompt
 
     Returns:
         A `VerifierResult` whose ``.index`` / ``.best`` is the chosen
@@ -207,7 +210,7 @@ def select(
         return score_directed_pairs(
             lazy, tasks, {task: pairs}, crits, note, n_evaluations,
             max_workers, cache, model=model, progress=show_progress,
-            on_error=on_error)
+            on_error=on_error, max_token=max_token)
 
     # Phase A: ring pass (slot bias cancels around the cycle).
     rng = random.Random(seed)

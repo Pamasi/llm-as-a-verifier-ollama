@@ -242,7 +242,7 @@ def _usage_from_response(response):
         prompt_details = getattr(usage, "prompt_tokens_details", None)
         cached = _int(getattr(prompt_details, "cached_tokens", 0))
         if not cached:
-            cached = _int(getattr(usage, "prompt_cache_hit_tokens", 0))
+            cached = _int(getattr(usage, "prompt_eval_cached_count", 0))
         completion_details = getattr(usage, "completion_tokens_details", None)
         return (_int(getattr(usage, "prompt_tokens", 0)),
                 cached,
@@ -256,8 +256,22 @@ def _usage_from_response(response):
         thoughts = _int(getattr(meta, "thoughts_token_count", 0))
         return (_int(getattr(meta, "prompt_token_count", 0)),
                 _int(getattr(meta, "cached_content_token_count", 0)),
-                _int(getattr(meta, "candidates_token_count", 0)) + thoughts,
+                _int(getattr(meta, "prompt_token_count", 0)) + thoughts,
                 thoughts)
+
+
+    ollama_msg = response
+    #TODO: find a stastic for ollama similar with the thinking modality
+    if ollama_msg is not None:  # ollama
+        # Ollama reports the reasoning trace separately from the answer; both
+        # are billed as output.
+        thoughts = _int(getattr(ollama_msg, "eval_count", 0))
+        return (_int(getattr(meta, "prompt_eval_count", 0)),
+                _int(getattr(meta, "prompt_eval_cached_count", 0)),
+                0,
+                0)
+
+
 
     return 0, 0, 0, 0
 
@@ -431,7 +445,7 @@ def resolve_model(client, model=DEFAULT_MODEL):
     return served
 
 def call_ollama(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
-                images=None):
+                images=None, max_token=4096):
     """Call an OpenAI-compatible verifier with logprobs.
     Returns (text, tokens, position_logprobs) — the same shape as
     `call_gemini`, so `extract_score` works unchanged."""
@@ -447,7 +461,7 @@ def call_ollama(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
     params = dict(
         model=resolve_model(client, model),
         messages=[{"role": "user", "content": content}],
-        options={ 'num_predict':4096,
+        options={ 'num_predict':max_token,
         'temperature':1.0,
         },
         logprobs=True,
@@ -725,7 +739,7 @@ def call_deepseek(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
 
 
 def call_verifier(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
-                  images=None):
+                  images=None, max_token=4096):
     """Route to the DeepSeek, OpenAI-compatible, or Gemini call based on the
     client type. Returns (text, tokens, position_logprobs)."""
     if getattr(client, "_llm_verifier_deepseek", False):
@@ -733,7 +747,7 @@ def call_verifier(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
                              images=images)
 
     elif isinstance(client, ollama.Client):
-        text, tokens, position_logprobs=  call_ollama(client, prompt, model, top_logprobs, images=images)
+        text, tokens, position_logprobs=  call_ollama(client, prompt, model, top_logprobs, images=images, max_token=max_token)
 
     elif _is_openai_client(client):
         text, tokens, position_logprobs=  call_openai(client, prompt, model, top_logprobs, images=images)
@@ -908,7 +922,8 @@ def build_prompt(problem, trace_a, trace_b, criterion, ground_truth_note,
 
 
 def score_pair_criterion(client, problem, trace_a, trace_b, criterion,
-                         ground_truth_note, model=DEFAULT_MODEL, images=None):
+                         ground_truth_note, model=DEFAULT_MODEL, 
+                         images=None, max_token=4096):
     """Score (A, B) for a single criterion, returning fine-grained rewards
     (R_A, R_B) in [0, 1]. `images` is attached as task context."""
     imgs = as_image_list(images)
@@ -916,7 +931,7 @@ def score_pair_criterion(client, problem, trace_a, trace_b, criterion,
         problem, trace_a, trace_b, criterion, ground_truth_note,
         n_images=len(imgs))
     text, tokens, position_logprobs = call_verifier(client, prompt, model,
-                                                    images=imgs)
+                                                    images=imgs, max_token=max_token)
     ra = extract_score(text, tokens, position_logprobs, "<score_A>")
     rb = extract_score(text, tokens, position_logprobs, "<score_B>")
     return ra, rb
@@ -970,7 +985,8 @@ class LazyClient:
 
 def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                          ground_truth_note, n_reps, max_workers, cache_file,
-                         model=DEFAULT_MODEL, progress=True, on_error="tie"):
+                         model=DEFAULT_MODEL, progress=True, 
+                         on_error="tie", max_token=4096):
     """Score every (criterion, rep) for the requested directed (task, a, b)
     pairs and merge into the cache on disk.
 
@@ -1058,7 +1074,7 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(score_pair_criterion, client, prob, ta, tb,
-                                crit, ground_truth_note, model, images):
+                                crit, ground_truth_note, model, images, max_token):
                     (key, swap)
                 for key, prob, ta, tb, crit, images, swap, _ in phase_jobs
             }
